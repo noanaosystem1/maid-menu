@@ -1,391 +1,182 @@
-# 狂気メイド喫茶 — External API 仕様書
+# 狂気メイド喫茶 — Cloudflare Worker API 仕様書
 
-Express サーバー（`server/index.js`）が提供する REST API。
-Supabase をバックエンドに使用。
+Cloudflare Workers + D1 構成で動作する REST API 仕様です。
 
 ## ベース URL
-
 ```
 http://<host>:<PORT>/api
 ```
-
-デフォルト PORT: `3000`（`.env` の `PORT` で変更可）
-
-## 共通仕様
-
-- リクエスト/レスポンス: `application/json`
-- CORS: 全オリジン許可（`server/index.js` の `cors()` による）
-- 認証: 不要（Supabase `service_role` キーでサーバーが直接操作）
-- エラー時: `{ error: string }` を返す（`handle` ミドルウェアで 500 になる）
+ローカルでのデフォルト PORT: `8787`
 
 ---
 
-## Room API
+## 共通仕様
+- リクエスト/レスポンス: `application/json`
+- CORS: 全オリジン許可
+- 認証:
+  - **一般ユーザー用 API**: 認証不要。
+  - **管理者用 API (Mutation & 顧客一覧)**: リクエストヘッダーに `X-Admin-Password` もしくは `Authorization` を付与し、正しい管理者パスワードを送信する必要があります。不一致の場合は `401 Unauthorized` を返却します。
+
+---
+
+## 1. Rooms API (ルーム管理)
 
 ### ルーム一覧取得
-
 ```
 GET /api/rooms
 ```
-
-**レスポンス 200:**
-```json
-[
-  {
-    "id": "uuid",
-    "name": "テーブルA",
-    "phase": "WAITING",
-    "created_date": "2025-01-01T00:00:00Z"
-  }
-]
-```
+- **認証**: 不要（公開）
+- **最適化**: Worker のグローバルインメモリキャッシュから高速返却されます（D1 アクセス 0 回）。
+- **レスポンス 200**:
+  ```json
+  [
+    {
+      "id": "uuid",
+      "name": "テーブルA",
+      "phase": "WAITING",
+      "created_date": "2026-07-10T14:56:02.130Z"
+    }
+  ]
+  ```
 
 ### ルーム詳細取得
-
 ```
 GET /api/rooms/:id
 ```
-
-**レスポンス 200:** ルーム1件
-**レスポンス 404:** `{ "error": "Room not found" }`
+- **認証**: 不要（公開）
+- **レスポンス 200**: ルーム1件
 
 ### ルーム作成
-
 ```
 POST /api/rooms
 Content-Type: application/json
+X-Admin-Password: <password>
 ```
-
-**リクエストボディ:**
-```json
-{
-  "name": "テーブルA",
-  "phase": "WAITING"
-}
-```
-
-- `name` (string, required): ルーム名
-- `phase` (string, optional): 初期フェーズ。デフォルト `"WAITING"`。有効値: `WAITING | MENU_OPEN | HACKING | BLACKOUT`
-
-**レスポンス 201:** 作成されたルーム
-**レスポンス 400:** `{ "error": "name is required" }`
+- **認証**: 管理者パスワードが必要
+- **リクエストボディ**:
+  ```json
+  {
+    "name": "テーブルA",
+    "phase": "WAITING"
+  }
+  ```
+- **レスポンス 201**: 作成されたルーム
 
 ### ルーム更新
-
 ```
 PATCH /api/rooms/:id
 Content-Type: application/json
+X-Admin-Password: <password>
 ```
+- **認証**: 管理者パスワードが必要
+- **リクエストボディ (部分更新)**:
+  ```json
+  {
+    "phase": "HACKING"
+  }
+  ```
+- **レスポンス 200**: 更新されたルーム
 
-**リクエストボディ（部分更新）:**
-```json
-{
-  "name": "新しい名前",
-  "phase": "HACKING"
-}
-```
-
-**レスポンス 200:** 更新後のルーム
-**レスポンス 404:** `{ "error": "Room not found" }`
-
-### ルーム削除 ✨
-
+### ルーム削除
 ```
 DELETE /api/rooms/:id
+X-Admin-Password: <password>
 ```
-
-**レスポンス 204:** 削除成功（ボディなし）
-**レスポンス 404:** `{ "error": "Room not found" }`
-
-> 注意: ルームに紐づく `guest_users` は DB の `ON DELETE CASCADE` で自動削除される。
+- **認証**: 管理者パスワードが必要
+- **レスポンス 204**: ボディなし（削除成功）
 
 ---
 
-## Guest / ユーザー API
+## 2. Guests API (ゲスト管理・リアルタイムオンライン状態)
 
-### ユーザー一覧取得
-
+### ゲスト一覧取得
 ```
-GET /api/guests?roomId=<uuid>
+GET /api/guests?roomId=<id>
 GET /api/guests?sessionToken=<token>
+GET /api/guests
 ```
+- **認証**:
+  - `roomId` または `sessionToken` パラメータ付きリクエスト: **認証不要**
+  - パラメータなしの全件リスト取得 (`GET /api/guests`): **管理者パスワードが必要**
+- **最適化**: 各ゲストの `isOnline` と `lastSeen` は、Worker の超高速インメモリ Map からロード・同期され、D1 への不要な Read クエリが削減されます。
 
-- `roomId` (optional): 指定するとそのルームのユーザーのみ取得
-- `sessionToken` (optional): 指定するとトークンで照合（1件 or 0件）
-
-**レスポンス 200:**
-```json
-[
-  {
-    "id": "uuid",
-    "name": "さくら",
-    "roomId": "uuid",
-    "sessionToken": "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
-    "isActive": true,
-    "isOnline": true,
-    "lastSeen": "2025-01-01T00:00:00Z",
-    "created_date": "2025-01-01T00:00:00Z"
-  }
-]
-```
-
-### ユーザー詳細取得
-
-```
-GET /api/guests?sessionToken=<token>
-```
-
-トークンでユーザーを検索。見つかれば1件を返す。
-
-### ユーザー作成
-
+### ゲスト登録
 ```
 POST /api/guests
 Content-Type: application/json
+X-Admin-Password: <password>
 ```
+- **認証**: 管理者パスワードが必要
+- **レスポンス 201**: 登録されたゲスト情報
 
-**リクエストボディ:**
-```json
-{
-  "name": "さくら",
-  "roomId": "room-uuid",
-  "sessionToken": "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
-  "isActive": true,
-  "isOnline": false
-}
-```
-
-- `name` (string, required): ユーザー名
-- `roomId` (string, required): 所属ルームの UUID
-- `sessionToken` (string, required): UUIDv4 推奨。このトークンを含む URL が招待リンクになる
-- `isActive` (boolean, optional): デフォルト `true`。`false` で強制キック相当
-- `isOnline` (boolean, optional): デフォルト `false`
-
-ゲスト画面の URL: `http://<host>/guest?token=<sessionToken>`
-
-**レスポンス 201:** 作成されたユーザー
-**レスポンス 400:** `{ "error": "name, roomId, sessionToken are required" }`
-
-### ユーザー更新
-
+### ゲストオンライン状態の更新（ポーリング用）
 ```
 PATCH /api/guests/:id
 Content-Type: application/json
 ```
+- **認証**: 不要（公開 - ゲスト自身のオンライン状態更新のため）
+- **リクエストボディ**:
+  ```json
+  {
+    "isOnline": true,
+    "lastSeen": "2026-07-10T14:56:56.006Z"
+  }
+  ```
+- **最適化**: `isOnline` または `lastSeen` のみの更新リクエストの場合、D1 へのクエリ発行・データベース書き込み（D1 Write）は一切行われず、**Worker のインメモリ上でのみ高速に状態が同期されます（D1 Write 0回）**。これにより、高頻度のポーリングでも D1 の実行限界数を超過しません。
+- **注意**: `name` や `roomId` などのデータベース書き換えを伴うフィールドを更新する場合は、管理者認証が必要となり、D1 への書き込みが発生します。
 
-**リクエストボディ（部分更新）:**
-```json
-{
-  "isOnline": true,
-  "lastSeen": "2025-01-01T00:00:00Z"
-}
+### ゲストオフラインイベント送信
 ```
-
-更新可能フィールド: `name`, `roomId`, `sessionToken`, `isActive`, `isOnline`, `lastSeen`
-
-**レスポンス 200:** 更新後のユーザー
-**レスポンス 404:** `{ "error": "Guest not found" }`
-
-### ユーザー完全削除 ✨
-
+POST /api/guests/:id/offline
 ```
-DELETE /api/guests/:id
-```
-
-ユーザーを DB から完全に削除する。
-
-**レスポンス 204:** 削除成功（ボディなし）
-**レスポンス 404:** `{ "error": "Guest not found" }`
-
-> 旧「キック（`isActive: false`）」に相当する操作は存在しない。完全に削除する API のみを提供する。
+- **認証**: 不要（公開）
+- **説明**: ゲストがブラウザタブを閉じた際（sendBeacon 等）に呼び出され、D1 Write を伴わずに Worker メモリ上のステータスを即時にオフラインへ切り替えます。
+- **レスポンス 204**: ボディなし
 
 ---
 
-## Menu Item API
+## 3. Menu Items API (メニュー管理)
 
 ### メニュー一覧取得
-
 ```
 GET /api/menu-items?limit=<number>
 ```
+- **認証**: 不要（公開）
+- **最適化**: Worker 内のグローバルキャッシュから高速返却されます（D1 アクセス 0 回）。
+- **レスポンス 200**: メニュー一覧
 
-- `limit` (optional): デフォルト `100`
-
-**レスポンス 200:**
-```json
-[
-  {
-    "id": "uuid",
-    "name": "オムライス♡",
-    "price": 980,
-    "category": "food",
-    "description": "ふわとろ卵の王道メニュー",
-    "imageUrl": null,
-    "order": 0,
-    "created_date": "2025-01-01T00:00:00Z"
-  }
-]
-```
-
-### メニュー作成
-
+### メニュー追加
 ```
 POST /api/menu-items
 Content-Type: application/json
+X-Admin-Password: <password>
 ```
-
-**リクエストボディ:**
-```json
-{
-  "name": "オムライス♡",
-  "price": 980,
-  "category": "food",
-  "description": "ふわとろ卵の王道メニュー",
-  "order": 0
-}
-```
-
-- `name` (string, required)
-- `price` (number, optional): デフォルト `0`
-- `category` (string, optional): `food | drink | dessert | special` など。デフォルト `"food"`
-- `description` (string, optional)
-- `imageUrl` (string, optional): 画像 URL
-- `order` (number, optional): 表示順。デフォルト `0`
-
-**レスポンス 201:** 作成されたメニューアイテム
-**レスポンス 400:** `{ "error": "name is required" }`
+- **認証**: 管理者パスワードが必要
+- **レスポンス 201**: 追加されたメニュー
 
 ### メニュー更新
-
 ```
 PATCH /api/menu-items/:id
 Content-Type: application/json
+X-Admin-Password: <password>
 ```
-
-**リクエストボディ（部分更新）:**
-```json
-{
-  "price": 1080,
-  "order": 1
-}
-```
-
-**レスポンス 200:** 更新後のメニューアイテム
-**レスポンス 404:** `{ "error": "Menu item not found" }`
+- **認証**: 管理者パスワードが必要
+- **レスポンス 200**: 更新されたメニュー
 
 ### メニュー削除
-
 ```
 DELETE /api/menu-items/:id
+X-Admin-Password: <password>
 ```
-
-**レスポンス 204:** 削除成功
-**レスポンス 404:** `{ "error": "Menu item not found" }`
+- **認証**: 管理者パスワードが必要
+- **レスポンス 204**: 削除成功
 
 ---
 
-## ヘルスチェック
+## 4. ヘルスチェック
 
 ```
 GET /api/health
 ```
-
-**レスポンス 200:**
-```json
-{ "ok": true, "database": "supabase" }
-```
-
-**レスポンス 503:**
-```json
-{ "ok": false, "error": "Supabase not configured" }
-```
-
----
-
-## 外部サービスからの利用例
-
-### ルーム作成 + ユーザー登録の例
-
-```bash
-# 1. ルーム作成
-curl -X POST http://localhost:3000/api/rooms \
-  -H "Content-Type: application/json" \
-  -d '{"name": "テーブルA"}'
-
-# レスポンス: {"id": "room-uuid", "name": "テーブルA", "phase": "WAITING", ...}
-
-# 2. ユーザー登録（招待リンク発行）
-curl -X POST http://localhost:3000/api/guests \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "さくら",
-    "roomId": "room-uuid",
-    "sessionToken": "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
-    "isActive": true,
-    "isOnline": false
-  }'
-
-# レスポンス: {"id": "user-uuid", "name": "さくら", "roomId": "room-uuid", ...}
-```
-
-### 招待 URL
-
-```
-http://<host>:<PORT>/guest?token=<sessionToken>
-```
-
-この URL にアクセスすると Phase が `WAITING` → `MENU_OPEN` → `HACKING` → `BLACKOUT` の流れで進行する。
-
----
-
-## セットアップ方法
-
-### 1. Supabase プロジェクト作成
-
-1. [Supabase](https://supabase.com) で新規プロジェクトを作成
-2. **SQL Editor** を開く
-3. `supabase/schema.sql` の内容を実行してテーブルを作成
-4. （任意）`supabase/seed.sql` でデモ用メニューデータを投入
-
-### 2. 環境変数設定
-
-プロジェクトルートに `.env` ファイルを作成：
-
-```env
-PORT=3000
-SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=eyJhbG...
-```
-
-値は Supabase Dashboard → **Project Settings → API** から取得：
-- `Project URL` → `SUPABASE_URL`
-- `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`（サーバー専用・秘密）
-
-### 3. ローカル起動
-
-```bash
-npm install
-npm run dev
-```
-
-- フロントエンド: http://localhost:5173
-- API: http://localhost:3000/api
-- 管理画面パスワード: `maid2024`
-
-### 4. ビルド & 本番起動
-
-```bash
-npm run build
-NODE_ENV=production npm start
-```
-
-### 5. Render デプロイ
-
-1. GitHub に push
-2. Render → **New → Blueprint** → `render.yaml` を選択
-3. 環境変数 `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` を設定
-4. デプロイ
-
-## 変更履歴
-
-- 2025-06-27: アクセスキー機能を完全削除、ルーム削除 (`DELETE /api/rooms/:id`) とユーザー完全削除 (`DELETE /api/guests/:id`) を追加
+- **レスポンス 200**: `{ "ok": true, "database": "d1" }`
+- **レスポンス 503**: `{ "ok": false, "error": "D1 connection failed" }`
