@@ -223,7 +223,11 @@ export default {
         }
         query += " ORDER BY created_date DESC";
 
-        const { results } = await env.DB.prepare(query).bind(...params).all();
+        let stmt = env.DB.prepare(query);
+        if (params.length > 0) {
+          stmt = stmt.bind(...params);
+        }
+        const { results } = await stmt.all();
 
         const enriched = results.map(row => {
           // Retrieve online status from our local isolate memory state first
