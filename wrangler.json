@@ -7,11 +7,18 @@
     "directory": "./dist",
     "binding": "ASSETS"
   },
-  "d1_databases": [
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MAID_CAFE_DO",
+        "class_name": "MaidCafeDO"
+      }
+    ]
+  },
+  "migrations": [
     {
-      "binding": "DB",
-      "database_name": "maid_cafe_db",
-      "database_id": "88888888-4444-4444-4444-121212121212"
+      "tag": "v1",
+      "new_sqlite_classes": ["MaidCafeDO"]
     }
   ],
   "vars": {

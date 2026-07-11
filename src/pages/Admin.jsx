@@ -45,7 +45,7 @@ export default function Admin() {
   useEffect(() => {
     loadData();
     if (!authed) return;
-    const interval = setInterval(loadData, 5000);
+    const interval = setInterval(loadData, 1000);
     return () => clearInterval(interval);
   }, [loadData, authed]);
 
