@@ -51,6 +51,7 @@ export default function Admin() {
 
   const handleLogout = () => {
     sessionStorage.removeItem(STORAGE_KEYS.ADMIN_AUTH);
+    sessionStorage.removeItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD);
     setAuthed(false);
   };
 

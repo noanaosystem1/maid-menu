@@ -1,60 +1,94 @@
-# 狂気メイド喫茶 — デジタルメニュー制御システム
+# 狂気メイド喫茶 — デジタルメニュー制御システム (Cloudflare Workers & D1 移行版)
 
-React + Express + **Supabase** のスタンドアロン構成。Render にデプロイ可能。
+React + Cloudflare Workers + Cloudflare D1 (SQLite) のモダンなサーバーレス構成。
 
 ## 構成
 
 ```
 メニュー/
-├── server/           Express API（Supabase 経由）
-├── supabase/         DB スキーマ SQL
+├── wrangler.json     Wrangler 設定ファイル
+├── server/
+│   └── worker.js     Cloudflare Workers API (D1 & 高速インメモリキャッシュ管理)
+├── migrations/
+│   └── 0001_schema.sql D1 用 DB スキーマ SQL
 ├── src/              React フロントエンド
-└── render.yaml       Render デプロイ設定
+└── dist/             ビルド済みフロントエンドアセット
 ```
 
-## Supabase セットアップ
+## Cloudflare D1 / Worker の最適化と仕組み
 
-1. [Supabase](https://supabase.com) でプロジェクト作成
-2. **SQL Editor** で `supabase/schema.sql` を実行
-3. **Project Settings → API** から以下を取得:
-   - `Project URL` → `SUPABASE_URL`
-   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`（サーバー専用・秘密）
+D1 への不要なクエリや書き込み（D1 Read/Write）を削減し、Cloudflare の実行制限（CPU時間やリクエスト数）を超過しないよう、以下の高度なインメモリキャッシュ設計を実装しています。
 
-## 環境変数
+1. **インメモリキャッシュによる D1 Read の極小化:**
+   - メニュー一覧 (`menu_items`) とルーム一覧 (`rooms`) を Worker のメモリ上にキャッシュします。
+   - 変更（POST/PATCH/DELETE などの管理操作）が走った場合のみキャッシュをクリア・リフレッシュし、通常時のゲスト側からのポーリング等では D1 への直接の Read クエリを 0 に抑えています。
 
-`.env.example` をコピーして `.env` を作成:
+2. **D1 Write の完全削減（オンラインポーリングの超軽量化）:**
+   - ゲスト（お客さん）がページを開いている間に定期送信される `isOnline` や `lastSeen` の更新は、**D1 への UPDATE クエリを完全に廃止**しました。
+   - 代わりに、Worker のグローバルインメモリ Map 内でアクセス時刻を記録・集計します。これにより、従来の最大ボトルネックであった D1 Write の消費を **完全に 0** に削減しました。
 
-```env
-SUPABASE_URL=https://xxxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=eyJhbG...
-PORT=3000
-```
+3. **管理サイトの認証セキュリティ:**
+   - パスワードは Worker 側の環境変数 `ADMIN_PASSWORD` (デフォルトは `"maid2024"`) にて安全に保持・検証。
+   - 管理画面から送信される `X-Admin-Password` (または `Authorization`) ヘッダーと照合し、管理 API への不正アクセスを未然に防止します。
 
-Render では Dashboard の Environment Variables に同じ値を設定（`render.yaml` 参照）。
+---
 
-## ローカル開発
+## ローカル開発環境のセットアップ
+
+### 1. 依存関係のインストール
 
 ```bash
 npm install
-npm run dev
 ```
 
-- フロント: http://localhost:5173
-- API: http://localhost:3000/api
-- 管理画面パスワード: `maid2024`
+### 2. ローカル D1 データベースの初期化 & マイグレーション実行
 
-## 本番
+```bash
+npx wrangler d1 migrations apply DB --local
+```
+
+### 3. デモデータの登録 (任意)
+
+```bash
+npx wrangler d1 execute DB --local --command="INSERT INTO menu_items (id, name, price, category, description, order_index) VALUES ('1', 'オムライス♡', 980, 'food', 'ふわとろ卵の王道メニュー', 0), ('2', '萌え萌えハンバーグ', 1280, 'food', 'デミグラスたっぷり', 1), ('3', 'ロイヤルミルクティー', 680, 'drink', '当店自慢 of ブレンド', 2), ('4', '毒々ベリーパフェ', 880, 'dessert', '見た目は可愛い、味は…？', 3), ('5', '秘密のスペシャルセット', 1980, 'special', 'メイド長おすすめ', 4);"
+```
+
+### 4. フロントエンドのビルド & ローカルサーバーの起動
 
 ```bash
 npm run build
-NODE_ENV=production npm start
+npm run dev
 ```
 
-## Render デプロイ
+- ブラウザで自動的に http://localhost:8787 にてフロントエンドと API が起動します。
+- 管理サイトのデフォルトパスワード: `maid2024`
 
-1. GitHub に push
-2. Render → **New → Blueprint** → `render.yaml`
-3. 環境変数 `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` を設定
-4. デプロイ
+---
 
-永続ディスクは不要（データは Supabase 上）。
+## 本番デプロイ
+
+### 1. リモート D1 データベースの作成
+
+Cloudflare Dashboard または Wrangler CLI で D1 データベースを作成します。
+
+```bash
+npx wrangler d1 create maid_cafe_db
+```
+
+作成された `database_id` を `wrangler.json` の `d1_databases[0].database_id` に設定してください。
+
+### 2. リモート D1 へのマイグレーション適用
+
+```bash
+npx wrangler d1 migrations apply DB --remote
+```
+
+### 3. デプロイの実行
+
+```bash
+npm run build
+npm run deploy
+```
+
+デプロイ完了後、Cloudflare 側で割り当てられた `xxx.workers.dev` などの URL からアクセス可能です。
+管理画面のパスワードを変更する場合は、Cloudflare Dashboard の Worker の設定（Settings -> Variables）から `ADMIN_PASSWORD` 環境変数を追加・更新してください。
