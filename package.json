@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "build": "vite build",
+    "build": "vite build && cp server/worker.js dist/_worker.js",
     "deploy": "wrangler deploy",
     "lint": "eslint . --quiet",
     "lint:fix": "eslint . --fix",

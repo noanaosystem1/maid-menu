@@ -1,11 +1,16 @@
 // Cloudflare Worker for Maid Cafe Menu System
-// Backed by Cloudflare D1 (SQLite) and using in-memory caching to minimize D1 read/write operations.
+// Backed by Cloudflare D1 (SQLite) and using in-memory caching & throttling to minimize D1 read/write operations.
 
-// In-memory caches (per V8 isolate / Worker instance)
+// In-memory caches (per V8 isolate / Worker instance) with TTL to support global multi-isolate synchronization
 let menuItemsCache = null;
-let roomsCache = null;
+let menuItemsCacheTime = 0;
+const MENU_ITEMS_CACHE_TTL = 5000; // 5 seconds cache for menu items
 
-// Guest online status: guestId -> { isOnline: boolean, lastSeen: string }
+let roomsCache = null;
+let roomsCacheTime = 0;
+const ROOMS_CACHE_TTL = 1000; // 1 second cache for rooms (aligns with 1s polling for near-instant updates)
+
+// Guest online status cache to provide fast isolate-level overrides
 const onlineGuests = new Map();
 
 const corsHeaders = {
@@ -56,10 +61,7 @@ export default {
 
     try {
       // --- PUBLIC / STATIC ASSETS ROUTING ---
-      // Cloudflare Worker Assets automatically serves static files if configured,
-      // but we still want to let API request pass.
       if (!path.startsWith("/api")) {
-        // If Wrangler ASSETS binding is present, serve static asset
         if (env.ASSETS) {
           return await env.ASSETS.fetch(request);
         }
@@ -82,7 +84,9 @@ export default {
 
       // GET /api/rooms
       if (path === "/api/rooms" && request.method === "GET") {
-        if (!roomsCache) {
+        const now = Date.now();
+        // Read from cache only if it's within 1 second (guarantees cross-isolate phase change sync inside 1 second)
+        if (!roomsCache || (now - roomsCacheTime > ROOMS_CACHE_TTL)) {
           const { results } = await env.DB.prepare("SELECT * FROM rooms ORDER BY created_date DESC").all();
           roomsCache = results.map(row => ({
             id: row.id,
@@ -90,6 +94,7 @@ export default {
             phase: row.phase,
             created_date: row.created_date,
           }));
+          roomsCacheTime = now;
         }
         return jsonResponse(roomsCache);
       }
@@ -98,13 +103,16 @@ export default {
       const roomDetailMatch = path.match(/^\/api\/rooms\/([a-zA-Z0-9-]+)$/);
       if (roomDetailMatch && request.method === "GET") {
         const roomId = roomDetailMatch[1];
-        // Check cache first
-        if (roomsCache) {
+
+        // Return from roomsCache if present and fresh
+        const now = Date.now();
+        if (roomsCache && (now - roomsCacheTime <= ROOMS_CACHE_TTL)) {
           const cachedRoom = roomsCache.find(r => r.id === roomId);
           if (cachedRoom) {
             return jsonResponse(cachedRoom);
           }
         }
+
         const room = await env.DB.prepare("SELECT * FROM rooms WHERE id = ?").bind(roomId).first();
         if (!room) {
           return jsonResponse({ error: "Room not found" }, 404);
@@ -159,7 +167,7 @@ export default {
           .bind(newName, newPhase, roomId)
           .run();
 
-        // Invalidate rooms cache
+        // Invalidate rooms cache immediately so this isolate responds with fresh data on the next microsecond
         roomsCache = null;
 
         return jsonResponse({
@@ -175,10 +183,8 @@ export default {
         requireAdmin();
         const roomId = roomDetailMatch[1];
 
-        // Delete cascading room users from D1 (SQLite doesn't always automatically enforce foreign keys unless configured, so let's delete them explicitly)
         await env.DB.prepare("DELETE FROM guest_users WHERE room_id = ?").bind(roomId).run();
-
-        const result = await env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(roomId).run();
+        await env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(roomId).run();
 
         // Invalidate rooms cache
         roomsCache = null;
@@ -212,7 +218,7 @@ export default {
         const { results } = await env.DB.prepare(query).bind(...params).all();
 
         const enriched = results.map(row => {
-          // Retrieve online status from our high-performance in-memory state
+          // Retrieve online status from our local isolate memory state first
           const cached = onlineGuests.get(row.id);
           const now = Date.now();
 
@@ -290,7 +296,6 @@ export default {
         const guestId = guestDetailMatch[1];
         const body = await request.json();
 
-        // Check if DB edit is required (e.g., changing name or room) or only polling update (isOnline, lastSeen)
         const hasDbFields = body.name !== undefined || body.roomId !== undefined || body.sessionToken !== undefined || body.isActive !== undefined;
 
         if (hasDbFields) {
@@ -311,7 +316,6 @@ export default {
             .bind(newName, newRoomId, newSessionToken, newIsActive, guestId)
             .run();
 
-          // Respond with updated D1 + cached online stats
           const cached = onlineGuests.get(guestId);
           return jsonResponse({
             id: guestId,
@@ -324,8 +328,7 @@ export default {
             created_date: current.created_date,
           });
         } else {
-          // --- LOW COST IN-MEMORY POLISHING ---
-          // Since it only updates isOnline/lastSeen, do NOT write to D1! Just save to memory!
+          // --- LOW COST D1 WRITE THROTTLING FOR HIGH FREQUENCY POLLING ---
           const current = await env.DB.prepare("SELECT * FROM guest_users WHERE id = ?").bind(guestId).first();
           if (!current) {
             return jsonResponse({ error: "Guest not found" }, 404);
@@ -334,7 +337,39 @@ export default {
           const isOnline = body.isOnline !== undefined ? Boolean(body.isOnline) : true;
           const lastSeen = body.lastSeen !== undefined ? body.lastSeen : new Date().toISOString();
 
+          // Save to this isolate's local memory immediately
           onlineGuests.set(guestId, { isOnline, lastSeen });
+
+          // Determine if we need to write to D1.
+          // To synchronize across global isolates and data centers perfectly while saving massive D1 Write queries:
+          // We write to D1 ONLY if:
+          // 1. The guest is changing offline -> online status in D1, OR
+          // 2. The guest's D1 last_seen timestamp is older than 15 seconds (15x D1 Write reduction for 1s polling!).
+          const dbIsOnline = current.is_online === 1;
+          const dbLastSeen = current.last_seen;
+
+          let shouldWriteToDb = false;
+
+          if (isOnline && !dbIsOnline) {
+            shouldWriteToDb = true; // State change offline -> online: Write immediately!
+          } else if (isOnline && dbIsOnline) {
+            if (!dbLastSeen) {
+              shouldWriteToDb = true;
+            } else {
+              const diff = Date.now() - new Date(dbLastSeen).getTime();
+              if (diff > 15000) {
+                shouldWriteToDb = true; // Throttle: write at most once every 15 seconds!
+              }
+            }
+          } else if (!isOnline && dbIsOnline) {
+            shouldWriteToDb = true; // State change online -> offline: Write immediately!
+          }
+
+          if (shouldWriteToDb) {
+            await env.DB.prepare("UPDATE guest_users SET is_online = ?, last_seen = ? WHERE id = ?")
+              .bind(isOnline ? 1 : 0, lastSeen, guestId)
+              .run();
+          }
 
           return jsonResponse({
             id: guestId,
@@ -353,11 +388,18 @@ export default {
       const guestOfflineMatch = path.match(/^\/api\/guests\/([a-zA-Z0-9-]+)\/offline$/);
       if (guestOfflineMatch && request.method === "POST") {
         const guestId = guestOfflineMatch[1];
-        // Set to offline inside high performance memory cache
+
+        // Set offline in local memory
         onlineGuests.set(guestId, {
           isOnline: false,
           lastSeen: new Date().toISOString(),
         });
+
+        // Write immediately to D1 to update other isolates
+        await env.DB.prepare("UPDATE guest_users SET is_online = 0, last_seen = ? WHERE id = ?")
+          .bind(new Date().toISOString(), guestId)
+          .run();
+
         return new Response(null, { status: 204, headers: corsHeaders });
       }
 
@@ -366,10 +408,7 @@ export default {
         requireAdmin();
         const guestId = guestDetailMatch[1];
         await env.DB.prepare("DELETE FROM guest_users WHERE id = ?").bind(guestId).run();
-
-        // Remove from memory
         onlineGuests.delete(guestId);
-
         return new Response(null, { status: 204, headers: corsHeaders });
       }
 
@@ -378,8 +417,10 @@ export default {
       // GET /api/menu-items
       if (path === "/api/menu-items" && request.method === "GET") {
         const limit = Number(url.searchParams.get("limit")) || 100;
+        const now = Date.now();
 
-        if (!menuItemsCache) {
+        // Read from cache only if it's within 5 seconds (menu items change very rarely)
+        if (!menuItemsCache || (now - menuItemsCacheTime > MENU_ITEMS_CACHE_TTL)) {
           const { results } = await env.DB.prepare("SELECT * FROM menu_items ORDER BY order_index ASC, created_date ASC").all();
           menuItemsCache = results.map(row => ({
             id: row.id,
@@ -391,6 +432,7 @@ export default {
             order: row.order_index,
             created_date: row.created_date,
           }));
+          menuItemsCacheTime = now;
         }
 
         const sliced = menuItemsCache.slice(0, limit);
@@ -419,7 +461,7 @@ export default {
           .bind(id, name.trim(), itemPrice, itemCategory, itemDesc, itemImg, itemOrder, createdDate)
           .run();
 
-        // Clear menu items cache
+        // Invalidate menu items cache
         menuItemsCache = null;
 
         return jsonResponse({
@@ -457,7 +499,7 @@ export default {
           .bind(newName, newPrice, newCategory, newDesc, newImg, newOrder, itemId)
           .run();
 
-        // Clear menu cache
+        // Invalidate menu cache
         menuItemsCache = null;
 
         return jsonResponse({
@@ -478,7 +520,7 @@ export default {
         const itemId = menuDetailMatch[1];
         await env.DB.prepare("DELETE FROM menu_items WHERE id = ?").bind(itemId).run();
 
-        // Clear menu cache
+        // Invalidate menu cache
         menuItemsCache = null;
 
         return new Response(null, { status: 204, headers: corsHeaders });

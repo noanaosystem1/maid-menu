@@ -58,7 +58,7 @@ export const GUEST_TEXT = {
 };
 
 // ===== ポーリング間隔 (ms) =====
-export const POLLING_INTERVAL = 2000;
+export const POLLING_INTERVAL = 1000;
 
 // ===== ハッキング カウントダウン秒数 =====
 export const HACKING_COUNTDOWN = 15;
