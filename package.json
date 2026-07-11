@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "build": "vite build && cp server/worker.js dist/_worker.js && echo '_worker.js' > dist/.assetsignore && echo '/* /index.html 200' > dist/_redirects",
+    "build": "vite build && cp server/worker.js dist/_worker.js && echo '_worker.js' > dist/.assetsignore",
     "deploy": "wrangler deploy",
     "lint": "eslint . --quiet",
     "lint:fix": "eslint . --fix",
