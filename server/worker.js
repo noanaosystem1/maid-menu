@@ -63,7 +63,15 @@ export default {
       // --- PUBLIC / STATIC ASSETS ROUTING ---
       if (!path.startsWith("/api")) {
         if (env.ASSETS) {
-          return await env.ASSETS.fetch(request);
+          // Attempt to fetch the static asset
+          let response = await env.ASSETS.fetch(request);
+
+          // If the asset doesn't exist (returns 404), fallback and serve the SPA root index.html
+          if (response.status === 404) {
+            const indexRequest = new Request(new URL("/index.html", request.url), request);
+            response = await env.ASSETS.fetch(indexRequest);
+          }
+          return response;
         }
         return new Response("Not Found", { status: 404 });
       }
