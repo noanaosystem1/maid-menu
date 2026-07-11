@@ -68,8 +68,7 @@ export default {
 
           // If the asset doesn't exist (returns 404), fallback and serve the SPA root index.html
           if (response.status === 404) {
-            const indexRequest = new Request(new URL("/index.html", request.url), request);
-            response = await env.ASSETS.fetch(indexRequest);
+            response = await env.ASSETS.fetch(new Request(new URL("/index.html", request.url)));
           }
           return response;
         }
