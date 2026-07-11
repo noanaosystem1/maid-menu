@@ -1,9 +1,24 @@
+import { STORAGE_KEYS } from "@/lib/constants";
+
 const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
 async function request(path, { method = "GET", body } = {}) {
+  const adminPassword = sessionStorage.getItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD);
+
+  const headers = {};
+
+  if (body) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  if (adminPassword) {
+    headers["X-Admin-Password"] = adminPassword;
+    headers["Authorization"] = adminPassword;
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
@@ -21,6 +36,7 @@ export const api = {
     get: (id) => request(`/rooms/${id}`),
     create: (data) => request("/rooms", { method: "POST", body: data }),
     update: (id, data) => request(`/rooms/${id}`, { method: "PATCH", body: data }),
+    delete: (id) => request(`/rooms/${id}`, { method: "DELETE" }),
   },
   guests: {
     list: (params = {}) => {

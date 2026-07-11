@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { X, Plus, RefreshCw, Copy, Check } from "lucide-react";
+import { X, Plus, Copy, Check } from "lucide-react";
 import { api } from "@/api/client";
 import { generateUUID, buildGuestUrl } from "@/lib/utils/token.js";
 

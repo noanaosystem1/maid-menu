@@ -4,11 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -n server,client -c blue,green \"npm run dev:server\" \"npm run dev:client\"",
-    "dev:client": "vite",
-    "dev:server": "node --watch server/index.js",
+    "dev": "wrangler dev",
     "build": "vite build",
-    "start": "node server/index.js",
+    "deploy": "wrangler deploy",
     "lint": "eslint . --quiet",
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc -p ./jsconfig.json",

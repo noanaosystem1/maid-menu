@@ -69,4 +69,5 @@ export const STORAGE_KEYS = {
   GUEST_DATA: "maid_guest_data",
   BLACKOUT_LOCK: (token) => `blackout_${token}`,
   ADMIN_AUTH: "maid_admin_auth",
+  ADMIN_AUTH_PASSWORD: "maid_admin_auth_password",
 };

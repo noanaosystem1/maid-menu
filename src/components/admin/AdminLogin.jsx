@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Lock, Eye, EyeOff } from "lucide-react";
-import { ADMIN_PASSWORD, STORAGE_KEYS } from "@/lib/constants";
+import { STORAGE_KEYS } from "@/lib/constants";
+import { api } from "@/api/client";
 
 export default function AdminLogin({ onAuthenticated }) {
   const [password, setPassword] = useState("");
@@ -8,19 +9,29 @@ export default function AdminLogin({ onAuthenticated }) {
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError("");
-    setTimeout(() => {
-      if (password === ADMIN_PASSWORD) {
-        sessionStorage.setItem(STORAGE_KEYS.ADMIN_AUTH, "1");
-        onAuthenticated();
-      } else {
-        setError("パスワードが正しくありません");
-      }
+
+    try {
+      // Temporarily store the entered password in sessionStorage so the api client uses it
+      sessionStorage.setItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD, password);
+
+      // Attempt to retrieve the full guest list (which requires admin authorization)
+      await api.guests.list();
+
+      // If it succeeded, finalize authentication
+      sessionStorage.setItem(STORAGE_KEYS.ADMIN_AUTH, "1");
+      onAuthenticated();
+    } catch (err) {
+      console.error("Login verification failed:", err);
+      // Clean up on failure
+      sessionStorage.removeItem(STORAGE_KEYS.ADMIN_AUTH_PASSWORD);
+      setError("パスワードが正しくありません");
+    } finally {
       setLoading(false);
-    }, 500);
+    }
   };
 
   return (
